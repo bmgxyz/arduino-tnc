@@ -1,0 +1,38 @@
+[package]
+name = "arduino-aprs"
+version = "0.1.0"
+authors = ["Bradley Gannon <bradley@bradleygannon.com>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "arduino-aprs"
+test = false
+bench = false
+
+[dependencies]
+avr-device = "0.8.1"
+crc = "3.4.0"
+#cyberpig = { path = "/home/bradley/Projects/cyberpig/" }
+embedded-hal = "1.0"
+heapless = "0.9.2"
+nb = "1.1.0"
+panic-halt = "1.0.0"
+ufmt = "0.2.0"
+
+[dependencies.arduino-hal]
+git = "https://github.com/rahix/avr-hal"
+rev = "e5c8f37fe48419956e722490a82b9ca9b9fc61a2"
+features = ["arduino-nano"]
+
+[profile.dev]
+panic = "abort"
+lto = true
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+debug = true
+lto = true
+opt-level = "s"
