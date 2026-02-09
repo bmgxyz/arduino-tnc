@@ -13,7 +13,6 @@ bench = false
 [dependencies]
 avr-device = "0.8.1"
 crc = "3.4.0"
-#cyberpig = { path = "/home/bradley/Projects/cyberpig/" }
 embedded-hal = "1.0"
 heapless = "0.9.2"
 nb = "1.1.0"
