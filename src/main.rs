@@ -8,6 +8,7 @@ use core::{
 };
 
 use embedded_hal::digital::OutputPin;
+use heapless::Vec;
 use panic_halt as _;
 
 static COUNTER: AtomicU16 = AtomicU16::new(0);
@@ -17,9 +18,10 @@ static SINE_TABLE: [u8; 32] = [
     1, 2, 4, 7, 9, 12,
 ];
 static mut UPDATE_DAC: bool = false;
+static mut NEXT_SYMBOL: bool = false;
 
-const _MARK_INCREMENT: u16 = 2048;
-const SPACE_INCREMENT: u16 = 3755;
+const MARK_INCREMENT: u16 = 2100;
+const SPACE_INCREMENT: u16 = 3838;
 
 #[avr_device::interrupt(atmega328p)]
 fn TIMER0_COMPA() {
@@ -31,6 +33,11 @@ fn TIMER0_COMPA() {
         unsafe { UPDATE_DAC = true };
     }
     COUNTER.store(new_counter, Ordering::SeqCst);
+}
+
+#[avr_device::interrupt(atmega328p)]
+fn TIMER1_COMPA() {
+    unsafe { NEXT_SYMBOL = true };
 }
 
 #[arduino_hal::entry]
@@ -47,10 +54,7 @@ fn main() -> ! {
     dac_timer.tccr0b().write(|w| w.cs0().prescale_8());
     // 52 * 8 = 416 cycles; at 16 MHz this gives a period of 26 µs (about 38460 Hz)
     dac_timer.ocr0a().write(|w| w.set(52));
-    // enable interrupt for output compare match A
     dac_timer.timsk0().write(|w| w.ocie0a().set_bit());
-
-    INCREMENT.store(SPACE_INCREMENT, Ordering::SeqCst);
 
     let mut dac_0 = pins.d2.into_output();
     let mut dac_1 = pins.d3.into_output();
@@ -58,6 +62,20 @@ fn main() -> ! {
     let mut dac_3 = pins.d5.into_output();
     let mut dac_4 = pins.d6.into_output();
     let mut led = pins.d13.into_output();
+
+    let symbol_timer = dp.TC1;
+    symbol_timer
+        .tccr1b()
+        .write(|w| w.wgm1().set(0b01).cs1().prescale_256());
+    // 52 * 256 = 13_312 cycles; at 16 MHz this gives a period of 832 µs (about 1202 Hz)
+    symbol_timer.ocr1a().write(|w| w.set(52));
+    symbol_timer.timsk1().write(|w| w.ocie1a().set_bit());
+
+    // ASCII letter B with three idle bits, one start bit, eight data bits, and one stop bit (8N1)
+    let message: Vec<bool, 13> = Vec::from_array([
+        true, true, true, false, false, true, false, false, false, false, true, false, true,
+    ]);
+    let mut message_index = 0;
 
     loop {
         if unsafe { read_volatile(&raw const UPDATE_DAC) } {
@@ -71,9 +89,15 @@ fn main() -> ! {
                 let _ = dac_4.set_state((sine_value & 0b00001 != 0).into());
             }
             led.toggle();
-            unsafe {
-                write_volatile(&raw mut UPDATE_DAC, false);
+            unsafe { write_volatile(&raw mut UPDATE_DAC, false) };
+        }
+        if unsafe { read_volatile(&raw const NEXT_SYMBOL) } {
+            match message.get(message_index).unwrap() {
+                true => INCREMENT.store(MARK_INCREMENT, Ordering::SeqCst),
+                false => INCREMENT.store(SPACE_INCREMENT, Ordering::SeqCst),
             }
+            message_index = (message_index + 1) % message.len();
+            unsafe { write_volatile(&raw mut NEXT_SYMBOL, false) };
         }
     }
 }
