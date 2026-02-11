@@ -4,12 +4,23 @@
 
 use core::cell::RefCell;
 
+use arduino_hal::hal::usart::Event;
+use arduino_hal::prelude::*;
 use arduino_hal::{
-    hal::port::{PD2, PD3, PD4, PD5, PD6},
-    port::{mode::Output, Pin},
+    hal::port::{PD0, PD1, PD2, PD3, PD4, PD5, PD6},
+    pac::usart0::RegisterBlock,
+    port::{
+        mode::{Input, Output},
+        Pin,
+    },
+    Usart,
 };
-use avr_device::interrupt::{self, Mutex};
+use avr_device::{
+    generic::Periph,
+    interrupt::{self, Mutex},
+};
 use embedded_hal::digital::OutputPin;
+use heapless::Vec;
 use panic_halt as _;
 
 static SINE_TABLE: [u8; 32] = [
@@ -17,13 +28,17 @@ static SINE_TABLE: [u8; 32] = [
     1, 2, 4, 7, 9, 12,
 ];
 
-static MESSAGE: [u8; 16] = *b"Bradley Gannon\r\n";
+static SERIAL: Mutex<
+    RefCell<Option<Usart<Periph<RegisterBlock, 192>, Pin<Input, PD0>, Pin<Output, PD1>>>>,
+> = Mutex::new(RefCell::new(None));
+
+static MESSAGE: Mutex<RefCell<Vec<u8, 512>>> = Mutex::new(RefCell::new(Vec::new()));
 
 static SENDER: Mutex<RefCell<Sender>> = Mutex::new(RefCell::new(Sender {
     counter: 0,
     increment: 0,
     byte_index: 0,
-    state: SenderState::Idle { index: 0 },
+    state: SenderState::Off,
     dac_0: None,
     dac_1: None,
     dac_2: None,
@@ -74,15 +89,17 @@ impl Sender {
                 *bit_index += 1;
                 if *bit_index >= 8 {
                     self.byte_index += 1;
+                    let message_length = interrupt::free(|cs| MESSAGE.borrow(cs).borrow().len());
                     self.state = SenderState::Stop {
-                        end_message: self.byte_index >= MESSAGE.len(),
+                        end_message: self.byte_index >= message_length,
                     };
                 }
             }
             SenderState::Stop { end_message } => {
                 if end_message {
-                    self.state = SenderState::Idle { index: 0 };
+                    self.state = SenderState::Off;
                     self.byte_index = 0;
+                    interrupt::free(|cs| MESSAGE.borrow(cs).borrow_mut().clear());
                 } else {
                     self.state = SenderState::Start;
                 }
@@ -92,8 +109,8 @@ impl Sender {
             SenderState::Off => 0,
             SenderState::Idle { .. } => MARK_INCREMENT,
             SenderState::Start => SPACE_INCREMENT,
-            SenderState::Data { bit_index } => {
-                if let Some(&byte) = MESSAGE.get(self.byte_index) {
+            SenderState::Data { bit_index } => interrupt::free(|cs| {
+                if let Some(&byte) = MESSAGE.borrow(cs).borrow().get(self.byte_index) {
                     let bit = ((byte >> bit_index) & 1) != 0;
                     if bit {
                         MARK_INCREMENT
@@ -103,7 +120,7 @@ impl Sender {
                 } else {
                     0
                 }
-            }
+            }),
             SenderState::Stop { .. } => MARK_INCREMENT,
         };
     }
@@ -143,14 +160,28 @@ fn TIMER1_COMPA() {
     });
 }
 
+#[avr_device::interrupt(atmega328p)]
+fn USART_RX() {
+    interrupt::free(|cs| {
+        if let Some(ref mut serial) = SERIAL.borrow(cs).borrow_mut().as_mut() {
+            if let Ok(b) = serial.read() {
+                if b == b'\n' {
+                    SENDER.borrow(cs).borrow_mut().state = SenderState::Idle { index: 0 };
+                }
+                let _ = MESSAGE.borrow(cs).borrow_mut().push(b);
+            }
+        }
+    });
+}
+
 #[arduino_hal::entry]
 fn main() -> ! {
-    unsafe { avr_device::interrupt::enable() };
-
     let dp = arduino_hal::Peripherals::take().unwrap();
     let pins = arduino_hal::pins!(dp);
 
-    let mut _serial = arduino_hal::default_serial!(dp, pins, 57600);
+    let mut serial = arduino_hal::default_serial!(dp, pins, 57600);
+    serial.listen(Event::RxComplete);
+    interrupt::free(|cs| *SERIAL.borrow(cs).borrow_mut() = Some(serial));
 
     interrupt::free(|cs| {
         let mut sender = SENDER.borrow(cs).borrow_mut();
@@ -176,6 +207,8 @@ fn main() -> ! {
     // account for overhead; this value seems to work well
     symbol_timer.ocr1a().write(|w| w.set(13_250));
     symbol_timer.timsk1().write(|w| w.ocie1a().set_bit());
+
+    unsafe { avr_device::interrupt::enable() };
 
     loop {}
 }
