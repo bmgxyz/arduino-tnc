@@ -17,15 +17,13 @@ static SINE_TABLE: [u8; 32] = [
     1, 2, 4, 7, 9, 12,
 ];
 
-// ASCII letter B with three idle bits, one start bit, eight data bits, and one stop bit (8N1)
-static MESSAGE: [bool; 13] = [
-    true, true, true, false, false, true, false, false, false, false, true, false, true,
-];
+static MESSAGE: [u8; 16] = *b"Bradley Gannon\r\n";
 
 static SENDER: Mutex<RefCell<Sender>> = Mutex::new(RefCell::new(Sender {
     counter: 0,
     increment: 0,
-    message_index: 0,
+    byte_index: 0,
+    state: SenderState::Idle { index: 0 },
     dac_0: None,
     dac_1: None,
     dac_2: None,
@@ -36,15 +34,79 @@ static SENDER: Mutex<RefCell<Sender>> = Mutex::new(RefCell::new(Sender {
 const MARK_INCREMENT: u16 = 2100;
 const SPACE_INCREMENT: u16 = 3838;
 
+const IDLE_DELAY: usize = 128;
+
+enum SenderState {
+    Off,
+    Idle { index: usize },
+    Start,
+    Data { bit_index: usize },
+    Stop { end_message: bool },
+}
+
 struct Sender {
     counter: u16,
     increment: u16,
-    message_index: usize,
+    byte_index: usize,
+    state: SenderState,
     dac_0: Option<Pin<Output, PD2>>,
     dac_1: Option<Pin<Output, PD3>>,
     dac_2: Option<Pin<Output, PD4>>,
     dac_3: Option<Pin<Output, PD5>>,
     dac_4: Option<Pin<Output, PD6>>,
+}
+
+impl Sender {
+    fn update(&mut self) {
+        match self.state {
+            SenderState::Off => (),
+            SenderState::Idle { ref mut index } => {
+                if *index >= IDLE_DELAY {
+                    self.state = SenderState::Start;
+                } else {
+                    *index += 1;
+                }
+            }
+            SenderState::Start => {
+                self.state = SenderState::Data { bit_index: 0 };
+            }
+            SenderState::Data { ref mut bit_index } => {
+                *bit_index += 1;
+                if *bit_index >= 8 {
+                    self.byte_index += 1;
+                    self.state = SenderState::Stop {
+                        end_message: self.byte_index >= MESSAGE.len(),
+                    };
+                }
+            }
+            SenderState::Stop { end_message } => {
+                if end_message {
+                    self.state = SenderState::Idle { index: 0 };
+                    self.byte_index = 0;
+                } else {
+                    self.state = SenderState::Start;
+                }
+            }
+        }
+        self.increment = match self.state {
+            SenderState::Off => 0,
+            SenderState::Idle { .. } => MARK_INCREMENT,
+            SenderState::Start => SPACE_INCREMENT,
+            SenderState::Data { bit_index } => {
+                if let Some(&byte) = MESSAGE.get(self.byte_index) {
+                    let bit = ((byte >> bit_index) & 1) != 0;
+                    if bit {
+                        MARK_INCREMENT
+                    } else {
+                        SPACE_INCREMENT
+                    }
+                } else {
+                    0
+                }
+            }
+            SenderState::Stop { .. } => MARK_INCREMENT,
+        };
+    }
 }
 
 #[avr_device::interrupt(atmega328p)]
@@ -54,31 +116,21 @@ fn TIMER0_COMPA() {
         sender.counter = sender.counter.wrapping_add(sender.increment);
         let sine_index = ((sender.counter >> 11) as usize).clamp(0, SINE_TABLE.len());
         if let Some(sine_value) = SINE_TABLE.get(sine_index) {
-            let _ = sender
-                .dac_0
-                .as_mut()
-                .unwrap()
-                .set_state((sine_value & 0b10000 != 0).into());
-            let _ = sender
-                .dac_1
-                .as_mut()
-                .unwrap()
-                .set_state((sine_value & 0b01000 != 0).into());
-            let _ = sender
-                .dac_2
-                .as_mut()
-                .unwrap()
-                .set_state((sine_value & 0b00100 != 0).into());
-            let _ = sender
-                .dac_3
-                .as_mut()
-                .unwrap()
-                .set_state((sine_value & 0b00010 != 0).into());
-            let _ = sender
-                .dac_4
-                .as_mut()
-                .unwrap()
-                .set_state((sine_value & 0b00001 != 0).into());
+            if let Some(ref mut dac_0) = sender.dac_0 {
+                let _ = dac_0.set_state((sine_value & 0b10000 != 0).into());
+            };
+            if let Some(ref mut dac_1) = sender.dac_1 {
+                let _ = dac_1.set_state((sine_value & 0b01000 != 0).into());
+            };
+            if let Some(ref mut dac_2) = sender.dac_2 {
+                let _ = dac_2.set_state((sine_value & 0b00100 != 0).into());
+            };
+            if let Some(ref mut dac_3) = sender.dac_3 {
+                let _ = dac_3.set_state((sine_value & 0b00010 != 0).into());
+            };
+            if let Some(ref mut dac_4) = sender.dac_4 {
+                let _ = dac_4.set_state((sine_value & 0b00001 != 0).into());
+            };
         }
     });
 }
@@ -87,11 +139,7 @@ fn TIMER0_COMPA() {
 fn TIMER1_COMPA() {
     interrupt::free(|cs| {
         let mut sender = SENDER.borrow(cs).borrow_mut();
-        match MESSAGE.get(sender.message_index).unwrap() {
-            true => sender.increment = MARK_INCREMENT,
-            false => sender.increment = SPACE_INCREMENT,
-        }
-        sender.message_index = (sender.message_index + 1) % MESSAGE.len();
+        sender.update();
     });
 }
 
@@ -126,7 +174,7 @@ fn main() -> ! {
         .write(|w| w.wgm1().set(0b01).cs1().direct());
     // this should theoretically be 13_333 cycles, but in practice we have to go a little faster to
     // account for overhead; this value seems to work well
-    symbol_timer.ocr1a().write(|w| w.set(12_750));
+    symbol_timer.ocr1a().write(|w| w.set(13_250));
     symbol_timer.timsk1().write(|w| w.ocie1a().set_bit());
 
     loop {}
