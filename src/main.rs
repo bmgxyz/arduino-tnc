@@ -3,6 +3,7 @@
 #![feature(abi_avr_interrupt)]
 
 use core::cell::RefCell;
+use core::hint::spin_loop;
 
 use arduino_hal::hal::usart::Event;
 use arduino_hal::prelude::*;
@@ -28,12 +29,11 @@ static SINE_TABLE: [u8; 32] = [
     1, 2, 4, 7, 9, 12,
 ];
 
-static SERIAL: Mutex<
-    RefCell<Option<Usart<Periph<RegisterBlock, 192>, Pin<Input, PD0>, Pin<Output, PD1>>>>,
-> = Mutex::new(RefCell::new(None));
+type Usart0 = Usart<Periph<RegisterBlock, 192>, Pin<Input, PD0>, Pin<Output, PD1>>;
 
+static SERIAL: Mutex<RefCell<Option<Usart0>>> = Mutex::new(RefCell::new(None));
 static MESSAGE: Mutex<RefCell<Vec<u8, 512>>> = Mutex::new(RefCell::new(Vec::new()));
-
+static KISS: Mutex<RefCell<KissState>> = Mutex::new(RefCell::new(KissState::Idle));
 static SENDER: Mutex<RefCell<Sender>> = Mutex::new(RefCell::new(Sender {
     counter: 0,
     increment: 0,
@@ -50,6 +50,55 @@ const MARK_INCREMENT: u16 = 2100;
 const SPACE_INCREMENT: u16 = 3838;
 
 const IDLE_DELAY: usize = 128;
+
+enum KissState {
+    Idle,
+    Fend { send: bool },
+    Command,
+    Data(u8),
+    Fesc,
+}
+
+impl KissState {
+    const FEND: u8 = 0xc0;
+    const FESC: u8 = 0xdb;
+    const TFEND: u8 = 0xdc;
+    const TFESC: u8 = 0xdd;
+    const COMMAND_DATA: u8 = 0x00;
+
+    fn update(&mut self, byte: u8) {
+        *self = match (&self, byte) {
+            // FEND after data means the frame is complete and ready to send
+            (KissState::Data(_), Self::FEND) => KissState::Fend { send: true },
+
+            // FEND anywhere else means the frame is incomplete and should not be sent, but a new
+            // frame is beginning
+            (_, Self::FEND) => KissState::Fend { send: false },
+
+            // Idle state waits for FEND
+            (KissState::Idle, _) => KissState::Idle,
+
+            // Command byte follows FEND
+            (KissState::Fend { .. }, Self::COMMAND_DATA) => KissState::Command,
+            (KissState::Fend { .. }, _) => KissState::Command,
+
+            // FESC can follow command or data
+            (KissState::Command, Self::FESC) => KissState::Fesc,
+            (KissState::Data(_), Self::FESC) => KissState::Fesc,
+
+            // Data follows command byte
+            (KissState::Command, b) => KissState::Data(b),
+
+            // Handle escaped bytes
+            (KissState::Fesc, Self::TFEND) => KissState::Data(Self::FEND),
+            (KissState::Fesc, Self::TFESC) => KissState::Data(Self::FESC),
+            (KissState::Fesc, b) => KissState::Data(b),
+
+            // Data follows data
+            (KissState::Data(_), b) => KissState::Data(b),
+        }
+    }
+}
 
 enum SenderState {
     Off,
@@ -165,10 +214,23 @@ fn USART_RX() {
     interrupt::free(|cs| {
         if let Some(ref mut serial) = SERIAL.borrow(cs).borrow_mut().as_mut() {
             if let Ok(b) = serial.read() {
-                if b == b'\n' {
-                    SENDER.borrow(cs).borrow_mut().state = SenderState::Idle { index: 0 };
-                }
-                let _ = MESSAGE.borrow(cs).borrow_mut().push(b);
+                let mut kiss_state = KISS.borrow(cs).borrow_mut();
+                kiss_state.update(b);
+                match *kiss_state {
+                    KissState::Fend { send } if send => {
+                        let mut sender = SENDER.borrow(cs).borrow_mut();
+                        if let SenderState::Off = sender.state {
+                            sender.state = SenderState::Idle { index: 0 };
+                        }
+                    }
+                    KissState::Data(d) => {
+                        let _ = MESSAGE.borrow(cs).borrow_mut().push(d);
+                    }
+                    KissState::Idle
+                    | KissState::Command
+                    | KissState::Fend { .. }
+                    | KissState::Fesc => (),
+                };
             }
         }
     });
@@ -210,5 +272,7 @@ fn main() -> ! {
 
     unsafe { avr_device::interrupt::enable() };
 
-    loop {}
+    loop {
+        spin_loop();
+    }
 }
