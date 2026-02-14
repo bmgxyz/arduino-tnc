@@ -20,6 +20,7 @@ use avr_device::{
     generic::Periph,
     interrupt::{self, Mutex},
 };
+use crc::{Crc, CRC_16_IBM_SDLC};
 use embedded_hal::digital::OutputPin;
 use heapless::Vec;
 use panic_halt as _;
@@ -37,7 +38,6 @@ static KISS: Mutex<RefCell<KissState>> = Mutex::new(RefCell::new(KissState::Idle
 static SENDER: Mutex<RefCell<Sender>> = Mutex::new(RefCell::new(Sender {
     counter: 0,
     increment: 0,
-    byte_index: 0,
     state: SenderState::Off,
     dac_0: None,
     dac_1: None,
@@ -48,8 +48,6 @@ static SENDER: Mutex<RefCell<Sender>> = Mutex::new(RefCell::new(Sender {
 
 const MARK_INCREMENT: u16 = 2100;
 const SPACE_INCREMENT: u16 = 3838;
-
-const IDLE_DELAY: usize = 128;
 
 enum KissState {
     Idle,
@@ -102,16 +100,25 @@ impl KissState {
 
 enum SenderState {
     Off,
-    Idle { index: usize },
-    Start,
-    Data { bit_index: usize },
-    Stop { end_message: bool },
+    StartFlag {
+        bit_index: u8,
+        count: usize,
+    },
+    Payload {
+        byte_index: usize,
+        bit_index: u8,
+        ones_count: usize,
+        stuff_bit: bool,
+    },
+    EndFlag {
+        bit_index: u8,
+        count: usize,
+    },
 }
 
 struct Sender {
     counter: u16,
     increment: u16,
-    byte_index: usize,
     state: SenderState,
     dac_0: Option<Pin<Output, PD2>>,
     dac_1: Option<Pin<Output, PD3>>,
@@ -121,92 +128,152 @@ struct Sender {
 }
 
 impl Sender {
-    fn update(&mut self) {
+    const START_FLAG_BYTES: usize = 45;
+    const END_FLAG_BYTES: usize = 15;
+
+    fn u8_index_msb(byte: u8, bit_index: u8) -> bool {
+        (byte >> (7 - bit_index)) & 1 != 0
+    }
+    fn sample_update(&mut self) {
+        self.counter = self.counter.wrapping_add(self.increment);
+        let sine_index = ((self.counter >> 11) as usize).clamp(0, SINE_TABLE.len());
+        if let Some(sine_value) = SINE_TABLE.get(sine_index) {
+            if let Some(ref mut dac_0) = self.dac_0 {
+                let _ = dac_0.set_state((sine_value & 0b10000 != 0).into());
+            };
+            if let Some(ref mut dac_1) = self.dac_1 {
+                let _ = dac_1.set_state((sine_value & 0b01000 != 0).into());
+            };
+            if let Some(ref mut dac_2) = self.dac_2 {
+                let _ = dac_2.set_state((sine_value & 0b00100 != 0).into());
+            };
+            if let Some(ref mut dac_3) = self.dac_3 {
+                let _ = dac_3.set_state((sine_value & 0b00010 != 0).into());
+            };
+            if let Some(ref mut dac_4) = self.dac_4 {
+                let _ = dac_4.set_state((sine_value & 0b00001 != 0).into());
+            };
+        }
+    }
+    fn symbol_update(&mut self) {
+        let new_symbol = match self.state {
+            SenderState::Off => None,
+            SenderState::StartFlag {
+                bit_index,
+                count: _,
+            }
+            | SenderState::EndFlag {
+                bit_index,
+                count: _,
+            } => Some(Self::u8_index_msb(0x7e, bit_index)),
+            SenderState::Payload {
+                byte_index,
+                bit_index,
+                ref mut ones_count,
+                ref mut stuff_bit,
+            } => {
+                if *stuff_bit {
+                    *stuff_bit = false;
+                    Some(false)
+                } else {
+                    let maybe_byte =
+                        interrupt::free(|cs| MESSAGE.borrow(cs).borrow().get(byte_index).cloned());
+                    if let Some(byte) = maybe_byte {
+                        let bit = Self::u8_index_msb(byte, bit_index);
+                        if bit {
+                            *ones_count += 1;
+                        } else {
+                            *ones_count = 0;
+                        }
+                        Some(bit)
+                    } else {
+                        Some(false)
+                    }
+                }
+            }
+        };
+        self.increment = match new_symbol {
+            Some(true) => self.increment,
+            Some(false) => {
+                if self.increment == MARK_INCREMENT {
+                    SPACE_INCREMENT
+                } else {
+                    MARK_INCREMENT
+                }
+            }
+            None => 0,
+        };
         match self.state {
             SenderState::Off => (),
-            SenderState::Idle { ref mut index } => {
-                if *index >= IDLE_DELAY {
-                    self.state = SenderState::Start;
-                } else {
-                    *index += 1;
-                }
-            }
-            SenderState::Start => {
-                self.state = SenderState::Data { bit_index: 0 };
-            }
-            SenderState::Data { ref mut bit_index } => {
+            SenderState::StartFlag {
+                ref mut bit_index,
+                ref mut count,
+            } => {
                 *bit_index += 1;
                 if *bit_index >= 8 {
-                    self.byte_index += 1;
-                    let message_length = interrupt::free(|cs| MESSAGE.borrow(cs).borrow().len());
-                    self.state = SenderState::Stop {
-                        end_message: self.byte_index >= message_length,
-                    };
+                    *count += 1;
+                    *bit_index = 0;
+                    if *count > Self::START_FLAG_BYTES {
+                        self.state = SenderState::Payload {
+                            byte_index: 0,
+                            bit_index: 0,
+                            ones_count: 0,
+                            stuff_bit: false,
+                        };
+                    }
                 }
             }
-            SenderState::Stop { end_message } => {
-                if end_message {
-                    self.state = SenderState::Off;
-                    self.byte_index = 0;
-                    interrupt::free(|cs| MESSAGE.borrow(cs).borrow_mut().clear());
+            SenderState::Payload {
+                ref mut byte_index,
+                ref mut bit_index,
+                ref mut ones_count,
+                ref mut stuff_bit,
+            } => {
+                if *ones_count >= 5 {
+                    *stuff_bit = true;
+                    *ones_count = 0;
                 } else {
-                    self.state = SenderState::Start;
+                    *bit_index += 1;
+                    if *bit_index >= 8 {
+                        *byte_index += 1;
+                        *bit_index = 0;
+                        let message_length =
+                            interrupt::free(|cs| MESSAGE.borrow(cs).borrow().len());
+                        if *byte_index >= message_length {
+                            self.state = SenderState::EndFlag {
+                                bit_index: 0,
+                                count: 0,
+                            };
+                        }
+                    }
+                }
+            }
+            SenderState::EndFlag {
+                ref mut bit_index,
+                ref mut count,
+            } => {
+                *bit_index += 1;
+                if *bit_index >= 8 {
+                    *count += 1;
+                    *bit_index = 0;
+                    if *count > Self::END_FLAG_BYTES {
+                        self.state = SenderState::Off;
+                        interrupt::free(|cs| MESSAGE.borrow(cs).borrow_mut().clear());
+                    }
                 }
             }
         }
-        self.increment = match self.state {
-            SenderState::Off => 0,
-            SenderState::Idle { .. } => MARK_INCREMENT,
-            SenderState::Start => SPACE_INCREMENT,
-            SenderState::Data { bit_index } => interrupt::free(|cs| {
-                if let Some(&byte) = MESSAGE.borrow(cs).borrow().get(self.byte_index) {
-                    let bit = ((byte >> bit_index) & 1) != 0;
-                    if bit {
-                        MARK_INCREMENT
-                    } else {
-                        SPACE_INCREMENT
-                    }
-                } else {
-                    0
-                }
-            }),
-            SenderState::Stop { .. } => MARK_INCREMENT,
-        };
     }
 }
 
 #[avr_device::interrupt(atmega328p)]
 fn TIMER0_COMPA() {
-    interrupt::free(|cs| {
-        let mut sender = SENDER.borrow(cs).borrow_mut();
-        sender.counter = sender.counter.wrapping_add(sender.increment);
-        let sine_index = ((sender.counter >> 11) as usize).clamp(0, SINE_TABLE.len());
-        if let Some(sine_value) = SINE_TABLE.get(sine_index) {
-            if let Some(ref mut dac_0) = sender.dac_0 {
-                let _ = dac_0.set_state((sine_value & 0b10000 != 0).into());
-            };
-            if let Some(ref mut dac_1) = sender.dac_1 {
-                let _ = dac_1.set_state((sine_value & 0b01000 != 0).into());
-            };
-            if let Some(ref mut dac_2) = sender.dac_2 {
-                let _ = dac_2.set_state((sine_value & 0b00100 != 0).into());
-            };
-            if let Some(ref mut dac_3) = sender.dac_3 {
-                let _ = dac_3.set_state((sine_value & 0b00010 != 0).into());
-            };
-            if let Some(ref mut dac_4) = sender.dac_4 {
-                let _ = dac_4.set_state((sine_value & 0b00001 != 0).into());
-            };
-        }
-    });
+    interrupt::free(|cs| SENDER.borrow(cs).borrow_mut().sample_update());
 }
 
 #[avr_device::interrupt(atmega328p)]
 fn TIMER1_COMPA() {
-    interrupt::free(|cs| {
-        let mut sender = SENDER.borrow(cs).borrow_mut();
-        sender.update();
-    });
+    interrupt::free(|cs| SENDER.borrow(cs).borrow_mut().symbol_update());
 }
 
 #[avr_device::interrupt(atmega328p)]
@@ -219,9 +286,23 @@ fn USART_RX() {
                 match *kiss_state {
                     KissState::Fend { send } if send => {
                         let mut sender = SENDER.borrow(cs).borrow_mut();
-                        if let SenderState::Off = sender.state {
-                            sender.state = SenderState::Idle { index: 0 };
+                        let mut message = MESSAGE.borrow(cs).borrow_mut();
+
+                        let crc = Crc::<u16>::new(&CRC_16_IBM_SDLC);
+                        let mut digest = crc.digest();
+                        digest.update(message.as_slice());
+                        let crc_bytes = digest.finalize().to_le_bytes();
+
+                        for byte in message.iter_mut() {
+                            *byte = byte.reverse_bits();
                         }
+                        let _ = message.push(crc_bytes[0].reverse_bits());
+                        let _ = message.push(crc_bytes[1].reverse_bits());
+
+                        sender.state = SenderState::StartFlag {
+                            bit_index: 0,
+                            count: 0,
+                        };
                     }
                     KissState::Data(d) => {
                         let _ = MESSAGE.borrow(cs).borrow_mut().push(d);
@@ -267,7 +348,7 @@ fn main() -> ! {
         .write(|w| w.wgm1().set(0b01).cs1().direct());
     // this should theoretically be 13_333 cycles, but in practice we have to go a little faster to
     // account for overhead; this value seems to work well
-    symbol_timer.ocr1a().write(|w| w.set(13_250));
+    symbol_timer.ocr1a().write(|w| w.set(13_300));
     symbol_timer.timsk1().write(|w| w.ocie1a().set_bit());
 
     unsafe { avr_device::interrupt::enable() };
