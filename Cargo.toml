@@ -1,12 +1,12 @@
 [package]
-name = "arduino-aprs"
+name = "arduino-tnc"
 version = "0.1.0"
 authors = ["Bradley Gannon <bradley@bradleygannon.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "arduino-aprs"
+name = "arduino-tnc"
 test = false
 bench = false
 

@@ -18,20 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 
 [[package]]
-name = "arduino-aprs"
-version = "0.1.0"
-dependencies = [
- "arduino-hal",
- "avr-device",
- "crc",
- "embedded-hal 1.0.0",
- "heapless",
- "nb 1.1.0",
- "panic-halt",
- "ufmt",
-]
-
-[[package]]
 name = "arduino-hal"
 version = "0.1.0"
 source = "git+https://github.com/rahix/avr-hal?rev=e5c8f37fe48419956e722490a82b9ca9b9fc61a2#e5c8f37fe48419956e722490a82b9ca9b9fc61a2"
@@ -41,6 +27,20 @@ dependencies = [
  "avr-hal-generic",
  "cfg-if",
  "embedded-hal 1.0.0",
+ "ufmt",
+]
+
+[[package]]
+name = "arduino-tnc"
+version = "0.1.0"
+dependencies = [
+ "arduino-hal",
+ "avr-device",
+ "crc",
+ "embedded-hal 1.0.0",
+ "heapless",
+ "nb 1.1.0",
+ "panic-halt",
  "ufmt",
 ]
 
