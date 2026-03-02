@@ -5,7 +5,9 @@
 use core::cell::RefCell;
 use core::hint::spin_loop;
 
+use arduino_hal::hal::port::PD7;
 use arduino_hal::hal::usart::Event;
+use arduino_hal::port::mode::OpenDrain;
 use arduino_hal::prelude::*;
 use arduino_hal::{
     hal::port::{PD0, PD1, PD2, PD3, PD4, PD5, PD6},
@@ -25,9 +27,9 @@ use embedded_hal::digital::OutputPin;
 use heapless::Vec;
 use panic_halt as _;
 
-static SINE_TABLE: [u8; 32] = [
-    16, 19, 22, 24, 27, 29, 30, 31, 31, 31, 30, 29, 27, 24, 22, 19, 16, 12, 9, 7, 4, 2, 1, 0, 0, 0,
-    1, 2, 4, 7, 9, 12,
+static TX_WAVE_TABLE: [u8; 32] = [
+    0, 0, 1, 2, 4, 7, 9, 12, 16, 19, 22, 24, 27, 29, 30, 31, 31, 31, 30, 29, 27, 24, 22, 19, 16,
+    12, 9, 7, 4, 2, 1, 0,
 ];
 
 type Usart0 = Usart<Periph<RegisterBlock, 192>, Pin<Input, PD0>, Pin<Output, PD1>>;
@@ -44,6 +46,7 @@ static SENDER: Mutex<RefCell<Sender>> = Mutex::new(RefCell::new(Sender {
     dac_2: None,
     dac_3: None,
     dac_4: None,
+    ptt: None,
 }));
 
 const MARK_INCREMENT: u16 = 2100;
@@ -125,6 +128,7 @@ struct Sender {
     dac_2: Option<Pin<Output, PD4>>,
     dac_3: Option<Pin<Output, PD5>>,
     dac_4: Option<Pin<Output, PD6>>,
+    ptt: Option<Pin<OpenDrain, PD7>>,
 }
 
 impl Sender {
@@ -134,25 +138,47 @@ impl Sender {
     fn u8_index_msb(byte: u8, bit_index: u8) -> bool {
         (byte >> (7 - bit_index)) & 1 != 0
     }
+    fn start(&mut self) {
+        self.state = SenderState::StartFlag {
+            bit_index: 0,
+            count: 0,
+        };
+        if let Some(ref mut ptt) = self.ptt {
+            ptt.set_low();
+        }
+    }
+    fn stop(&mut self) {
+        self.state = SenderState::Off;
+        if let Some(ref mut ptt) = self.ptt {
+            ptt.set_high();
+        }
+    }
+    fn set_dac(&mut self, value: u8) {
+        if let Some(ref mut dac_0) = self.dac_0 {
+            let _ = dac_0.set_state((value & 0b10000 != 0).into());
+        };
+        if let Some(ref mut dac_1) = self.dac_1 {
+            let _ = dac_1.set_state((value & 0b01000 != 0).into());
+        };
+        if let Some(ref mut dac_2) = self.dac_2 {
+            let _ = dac_2.set_state((value & 0b00100 != 0).into());
+        };
+        if let Some(ref mut dac_3) = self.dac_3 {
+            let _ = dac_3.set_state((value & 0b00010 != 0).into());
+        };
+        if let Some(ref mut dac_4) = self.dac_4 {
+            let _ = dac_4.set_state((value & 0b00001 != 0).into());
+        };
+    }
     fn sample_update(&mut self) {
+        if matches!(self.state, SenderState::Off) {
+            self.set_dac(16);
+            return;
+        }
         self.counter = self.counter.wrapping_add(self.increment);
-        let sine_index = ((self.counter >> 11) as usize).clamp(0, SINE_TABLE.len());
-        if let Some(sine_value) = SINE_TABLE.get(sine_index) {
-            if let Some(ref mut dac_0) = self.dac_0 {
-                let _ = dac_0.set_state((sine_value & 0b10000 != 0).into());
-            };
-            if let Some(ref mut dac_1) = self.dac_1 {
-                let _ = dac_1.set_state((sine_value & 0b01000 != 0).into());
-            };
-            if let Some(ref mut dac_2) = self.dac_2 {
-                let _ = dac_2.set_state((sine_value & 0b00100 != 0).into());
-            };
-            if let Some(ref mut dac_3) = self.dac_3 {
-                let _ = dac_3.set_state((sine_value & 0b00010 != 0).into());
-            };
-            if let Some(ref mut dac_4) = self.dac_4 {
-                let _ = dac_4.set_state((sine_value & 0b00001 != 0).into());
-            };
+        let sine_index = ((self.counter >> 11) as usize).clamp(0, TX_WAVE_TABLE.len());
+        if let Some(sine_value) = TX_WAVE_TABLE.get(sine_index) {
+            self.set_dac(*sine_value);
         }
     }
     fn symbol_update(&mut self) {
@@ -257,7 +283,7 @@ impl Sender {
                     *count += 1;
                     *bit_index = 0;
                     if *count > Self::END_FLAG_BYTES {
-                        self.state = SenderState::Off;
+                        self.stop();
                         interrupt::free(|cs| MESSAGE.borrow(cs).borrow_mut().clear());
                     }
                 }
@@ -299,10 +325,7 @@ fn USART_RX() {
                         let _ = message.push(crc_bytes[0].reverse_bits());
                         let _ = message.push(crc_bytes[1].reverse_bits());
 
-                        sender.state = SenderState::StartFlag {
-                            bit_index: 0,
-                            count: 0,
-                        };
+                        sender.start();
                     }
                     KissState::Data(d) => {
                         let _ = MESSAGE.borrow(cs).borrow_mut().push(d);
@@ -333,6 +356,8 @@ fn main() -> ! {
         sender.dac_2 = Some(pins.d4.into_output());
         sender.dac_3 = Some(pins.d5.into_output());
         sender.dac_4 = Some(pins.d6.into_output());
+        sender.ptt = Some(pins.d7.into_opendrain_high());
+        sender.set_dac(0);
     });
 
     let dac_timer = dp.TC0;
